@@ -58,6 +58,7 @@ If and only if you need to run a shell command, call the tool by replying with e
 Rules:
 - Use a single command only.
 - Prefer read-only inspection commands when possible.
+- If you output a command directly, output only the command line and nothing else.
 - Do not ask for confirmation.
 - After tool output is provided, answer the user normally and do not emit another exec tag unless another command is strictly required.
 """
@@ -302,7 +303,7 @@ class RKLLMEngine:
             self.model_path = model_path
             self._reinit_model()
 
-    def stream_chat(self, prompt: str):
+    def stream_chat(self, prompt: str, keep_history: int = 1):
         with self._run_lock:
             token_queue: queue.Queue = queue.Queue()
             with self._state_lock:
@@ -316,7 +317,7 @@ class RKLLMEngine:
             infer.mode = RKLLMInferMode.RKLLM_INFER_GENERATE
             infer.lora_params = None
             infer.prompt_cache_params = None
-            infer.keep_history = 1
+            infer.keep_history = keep_history
 
             rkllm_input = RKLLMInput()
             rkllm_input.role = b"user"
@@ -409,6 +410,36 @@ def get_model_file_info(model_path: str):
     }
 
 
+def detect_builtin_answer(prompt: str):
+    normalized = prompt.strip().lower()
+    if any(
+        phrase in normalized
+        for phrase in [
+            "размер контекста",
+            "контекст",
+            "context size",
+            "context window",
+            "max context",
+            "max_context",
+        ]
+    ):
+        return (
+            "Размер контекста текущей конфигурации RKLLM: 4096 токенов.\n\n"
+            f"Активная модель: {os.path.basename(engine.model_path)}"
+        )
+    if any(
+        phrase in normalized
+        for phrase in [
+            "какая модель",
+            "текущая модель",
+            "active model",
+            "current model",
+        ]
+    ):
+        return f"Сейчас активна модель: {os.path.basename(engine.model_path)}"
+    return None
+
+
 def parse_exec_command(text: str):
     stripped = text.strip()
     if stripped.startswith("<exec>"):
@@ -416,9 +447,25 @@ def parse_exec_command(text: str):
         if command.endswith("</exec>"):
             command = command[: -len("</exec>")]
         return command.strip() or None
+    fenced_match = re.match(r"^```(?:bash|sh)?\s*\n(.+?)\n```$", stripped, re.DOTALL)
+    if fenced_match:
+        candidate = fenced_match.group(1).strip()
+        if "\n" not in candidate:
+            return candidate or None
     malformed_match = re.match(r"^<exec\s+(.+?)>\s*$", stripped, re.DOTALL)
     if malformed_match:
         return malformed_match.group(1).strip() or None
+    if "\n" not in stripped:
+        plain = stripped.strip("`").strip()
+        if re.fullmatch(r"[A-Za-z0-9_./:=@%+\- ]{1,120}", plain):
+            first_word = plain.split()[0]
+            shell_verbs = {
+                "pwd", "ls", "uname", "cat", "grep", "find", "df", "free", "whoami", "id",
+                "ps", "top", "du", "stat", "head", "tail", "echo", "mount", "ip", "ifconfig",
+                "hostname", "env", "printenv", "date", "uptime", "dmesg", "lscpu", "lsblk",
+            }
+            if first_word in shell_verbs:
+                return plain
     return None
 
 
@@ -545,11 +592,12 @@ def chat():
     allow_terminal = bool(data.get("allow_terminal"))
     if not prompt:
         return jsonify({"error": "message is required"}), 400
+    builtin_answer = detect_builtin_answer(prompt)
 
-    def stream_once(message: str):
+    def stream_once(message: str, keep_history: int = 1):
         full_text = ""
         final_stats = None
-        for chunk in engine.stream_chat(message):
+        for chunk in engine.stream_chat(message, keep_history=keep_history):
             if chunk["type"] == "token":
                 full_text += chunk["text"]
             elif chunk["type"] == "meta":
@@ -558,6 +606,11 @@ def chat():
 
     def generate():
         try:
+            if builtin_answer is not None:
+                for char in builtin_answer:
+                    yield f"data: {json.dumps({'type': 'token', 'text': char}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'meta', 'stats': {'tokens': 0, 'tokens_per_second': 0.0, 'prefill_tokens': 0, 'memory_usage_mb': 0.0}}, ensure_ascii=False)}\n\n"
+                return
             if not allow_terminal:
                 for chunk in engine.stream_chat(prompt):
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
@@ -565,12 +618,13 @@ def chat():
 
             current_prompt = (
                 f"{TERMINAL_TOOL_PROMPT}\n"
+                "Answer in the same language as the user.\n"
                 f"User request:\n{prompt}\n"
                 "If no terminal command is needed, answer directly."
             )
 
             for _ in range(MAX_TOOL_STEPS):
-                assistant_text, final_stats = stream_once(current_prompt)
+                assistant_text, final_stats = stream_once(current_prompt, keep_history=0)
                 exec_command = parse_exec_command(assistant_text)
                 if exec_command is None:
                     for char in assistant_text:
@@ -593,17 +647,22 @@ def chat():
 
                 yield f"data: {json.dumps({'type': 'tool_result', 'result': result}, ensure_ascii=False)}\n\n"
                 current_prompt = (
+                    "Answer in the same language as the user.\n"
+                    f"Original user request:\n{prompt}\n\n"
                     "Tool result from terminal.exec.\n"
                     f"Command: {result['command']}\n"
                     f"Exit code: {result['returncode']}\n"
                     f"Duration ms: {result['duration_ms']}\n"
                     "Output:\n"
                     f"{result['output']}\n\n"
-                    "Now answer the user normally. Do not emit an exec tag unless another command is strictly required."
+                    "Now answer the user normally in plain language. Do not just repeat the command or wrap the output in a code block unless the user asked for raw output. Do not emit an exec tag unless another command is strictly required."
                 )
 
-            fallback_text = "Tool loop limit reached. Answer without more terminal commands."
-            assistant_text, final_stats = stream_once(fallback_text)
+            fallback_text = (
+                f"Original user request:\n{prompt}\n\n"
+                "Tool loop limit reached. Answer the user with the best available information and no more terminal commands."
+            )
+            assistant_text, final_stats = stream_once(fallback_text, keep_history=0)
             for char in assistant_text:
                 yield f"data: {json.dumps({'type': 'token', 'text': char}, ensure_ascii=False)}\n\n"
             if final_stats is not None:
