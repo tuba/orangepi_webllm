@@ -10,6 +10,10 @@
       --bg-2: #111936;
       --panel: rgba(15, 24, 49, 0.78);
       --panel-border: rgba(179, 203, 255, 0.16);
+      --input-bg: rgba(255, 255, 255, 0.04);
+      --input-border: rgba(255, 255, 255, 0.08);
+      --dropdown-bg: #172445;
+      --dropdown-text: #eff4ff;
       --text: #eff4ff;
       --muted: #94a3c7;
       --accent: #67e8f9;
@@ -316,6 +320,37 @@
       padding: 0 4px;
     }
 
+    .toggle-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .toggle-row input[type="checkbox"] {
+      margin-top: 2px;
+      width: 18px;
+      height: 18px;
+      accent-color: #67e8f9;
+    }
+
+    .toggle-copy strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 13px;
+      color: var(--text);
+    }
+
+    .toggle-copy span {
+      display: block;
+      color: var(--muted);
+      line-height: 1.45;
+      font-size: 13px;
+    }
+
     .composer {
       border-top: 1px solid rgba(255, 255, 255, 0.06);
       padding: 18px;
@@ -331,12 +366,33 @@
       min-height: 64px;
       max-height: 180px;
       border-radius: 18px;
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--input-border);
+      background: var(--input-bg);
       color: var(--text);
       padding: 16px 18px;
       font: inherit;
       outline: none;
+    }
+
+    .model-select {
+      padding: 14px 16px;
+      border-radius: 16px;
+      border: 1px solid var(--input-border);
+      background: var(--input-bg);
+      color: var(--text);
+      font: inherit;
+      color-scheme: dark;
+    }
+
+    .model-select option {
+      background: var(--dropdown-bg);
+      color: var(--dropdown-text);
+    }
+
+    .model-select:focus {
+      outline: none;
+      border-color: rgba(103, 232, 249, 0.45);
+      box-shadow: 0 0 0 4px rgba(103, 232, 249, 0.08);
     }
 
     .composer textarea:focus {
@@ -402,9 +458,24 @@
           <strong>Mode</strong>
           <div class="meta">Single live session with token streaming</div>
         </div>
+        <div class="meta-card">
+          <strong>Memory</strong>
+          <div class="meta" id="memoryLabel">Loading...</div>
+        </div>
+        <div class="meta-card">
+          <strong>Model Load</strong>
+          <div class="meta" id="modelLoadLabel">No recent switch</div>
+        </div>
       </div>
 
-      <select id="modelSelect" style="padding:14px 16px;border-radius:16px;border:1px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.04);color:var(--text);font:inherit;"></select>
+      <select id="modelSelect" class="model-select"></select>
+      <label class="toggle-row" for="terminalToggle">
+        <input id="terminalToggle" type="checkbox">
+        <span class="toggle-copy">
+          <strong>Terminal Tool</strong>
+          <span>Allow MCP-style `terminal.exec` calls on the Orange Pi and feed the result back into the model.</span>
+        </span>
+      </label>
       <button id="resetBtn">Reset Conversation</button>
       <button id="stopBtn" disabled>Stop Generation</button>
       <p class="hint">Enter sends the message. Shift+Enter inserts a new line.</p>
@@ -438,8 +509,12 @@
     const statusTextEl = document.getElementById("statusText");
     const modelSelectEl = document.getElementById("modelSelect");
     const currentModelLabelEl = document.getElementById("currentModelLabel");
+    const memoryLabelEl = document.getElementById("memoryLabel");
+    const modelLoadLabelEl = document.getElementById("modelLoadLabel");
+    const terminalToggleEl = document.getElementById("terminalToggle");
 
     let isBusy = false;
+    let statusTimer = null;
 
     function setBusy(nextBusy, label) {
       isBusy = nextBusy;
@@ -447,6 +522,7 @@
       resetBtnEl.disabled = nextBusy;
       stopBtnEl.disabled = !nextBusy;
       modelSelectEl.disabled = nextBusy;
+      terminalToggleEl.disabled = nextBusy;
       promptEl.disabled = nextBusy;
       statusTextEl.textContent = label;
     }
@@ -464,6 +540,33 @@
           currentModelLabelEl.textContent = model.label;
         }
       }
+    }
+
+    function applyStatus(payload) {
+      if (payload.models) {
+        applyModels(payload.models);
+      }
+      if (payload.memory) {
+        memoryLabelEl.textContent =
+          `${payload.memory.available_mb} MB available | ${payload.memory.free_mb} MB free | swap ${payload.memory.swap_free_mb}/${payload.memory.swap_total_mb} MB`;
+      }
+      if (payload.model_load) {
+        modelLoadLabelEl.textContent =
+          `${payload.model_load.label} | ${Number(payload.model_load.size_mb || 0).toFixed(0)} MB | ${Number(payload.model_load.load_time_ms || 0).toFixed(0)} ms`;
+      }
+    }
+
+    function formatLoadSummary(modelLoad) {
+      if (!modelLoad) {
+        return "";
+      }
+      return [
+        `Loaded ${modelLoad.label}`,
+        `${Number(modelLoad.size_mb || 0).toFixed(0)} MB`,
+        `${Number(modelLoad.load_time_ms || 0).toFixed(0)} ms`,
+        `RAM ${modelLoad.memory_after.available_mb} MB available`,
+        `swap ${modelLoad.memory_after.swap_free_mb}/${modelLoad.memory_after.swap_total_mb} MB`
+      ].join(" | ");
     }
 
     function scrollToBottom() {
@@ -489,6 +592,15 @@
       messagesEl.appendChild(wrapper);
       scrollToBottom();
       return { bubble, meta };
+    }
+
+    function addToolMessage(title, text, metaText = "") {
+      const message = addMessage("assistant", "");
+      message.bubble.innerHTML = renderMarkdown(`### ${title}\n\n\`\`\`\n${text}\n\`\`\``);
+      if (metaText) {
+        message.meta.textContent = metaText;
+      }
+      return message;
     }
 
     function escapeHtml(text) {
@@ -575,6 +687,27 @@
       applyModels(payload.models);
     }
 
+    async function refreshStatus() {
+      const response = await fetch("/api/status");
+      if (!response.ok) {
+        throw new Error("Status request failed");
+      }
+      const payload = await response.json();
+      applyStatus(payload);
+    }
+
+    function startStatusPolling() {
+      if (statusTimer !== null) {
+        clearInterval(statusTimer);
+      }
+      statusTimer = setInterval(async () => {
+        try {
+          await refreshStatus();
+        } catch (_error) {
+        }
+      }, 5000);
+    }
+
     async function sendMessage(message) {
       setBusy(true, "Generating...");
       addMessage("user", message);
@@ -586,7 +719,7 @@
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message })
+        body: JSON.stringify({ message, allow_terminal: terminalToggleEl.checked })
       });
 
       if (!response.ok || !response.body) {
@@ -619,6 +752,14 @@
           } else if (payload.type === "meta") {
             assistantMeta.textContent =
               `${payload.stats.tokens} tokens • ${Number(payload.stats.tokens_per_second || 0).toFixed(2)} tok/s • prefill ${payload.stats.prefill_tokens} • ${Number(payload.stats.memory_usage_mb || 0).toFixed(0)} MB`;
+          } else if (payload.type === "tool_call") {
+            addToolMessage("terminal.exec", payload.command, "Tool call");
+          } else if (payload.type === "tool_result") {
+            addToolMessage(
+              "terminal.exec result",
+              payload.result.output,
+              `exit ${payload.result.returncode} | ${Number(payload.result.duration_ms || 0).toFixed(0)} ms`
+            );
           } else if (payload.type === "error") {
             assistantMeta.textContent = `Error: ${payload.message}`;
           }
@@ -686,8 +827,10 @@
     modelSelectEl.addEventListener("change", async () => {
       if (isBusy) return;
       const modelId = modelSelectEl.value;
+      const selectedLabel = modelSelectEl.options[modelSelectEl.selectedIndex]?.textContent || modelId;
       try {
-        setBusy(true, "Switching model...");
+        modelLoadLabelEl.textContent = `Loading ${selectedLabel}...`;
+        setBusy(true, `Loading ${selectedLabel}...`);
         const response = await fetch("/api/model", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -697,11 +840,16 @@
         if (!response.ok) {
           throw new Error(payload.error || "Model switch failed");
         }
-        applyModels(payload.models);
+        applyStatus(payload);
         messagesEl.innerHTML = "";
-        addMessage("assistant", `Switched to ${currentModelLabelEl.textContent}.`);
+        const summary = formatLoadSummary(payload.model_load);
+        addMessage(
+          "assistant",
+          summary ? `Switched to ${currentModelLabelEl.textContent}.\n\n${summary}` : `Switched to ${currentModelLabelEl.textContent}.`
+        );
         setBusy(false, "Ready");
       } catch (error) {
+        modelLoadLabelEl.textContent = `Load failed: ${error.message}`;
         setBusy(false, "Error");
         addMessage("assistant", `Model switch failed: ${error.message}`);
       }
@@ -710,7 +858,8 @@
     window.addEventListener("load", async () => {
       try {
         setBusy(true, "Initializing...");
-        await loadModels();
+        await refreshStatus();
+        startStatusPolling();
         await resetConversation({ silent: true });
         addMessage("assistant", "Ready. Start chatting with Gemma.");
       } catch (error) {

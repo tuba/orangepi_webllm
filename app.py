@@ -2,7 +2,9 @@ import ctypes
 import json
 import os
 import queue
+import re
 import resource
+import subprocess
 import threading
 import time
 from typing import Optional
@@ -22,6 +24,9 @@ LIB_PATH = os.environ.get(
 )
 HOST = os.environ.get("WEBCHAT_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WEBCHAT_PORT", "8080"))
+COMMAND_TIMEOUT_SECONDS = int(os.environ.get("WEBCHAT_COMMAND_TIMEOUT", "20"))
+MAX_COMMAND_OUTPUT_CHARS = int(os.environ.get("WEBCHAT_MAX_COMMAND_OUTPUT_CHARS", "12000"))
+MAX_TOOL_STEPS = int(os.environ.get("WEBCHAT_MAX_TOOL_STEPS", "3"))
 
 
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"))
@@ -44,6 +49,18 @@ MODEL_CATALOG = [
         "path": os.path.join(MODEL_DIR, "gemma-3n-E2B-it-rk3588-w8a8-opt-1-hybrid-ratio-0.0.rkllm"),
     },
 ]
+
+
+TERMINAL_TOOL_PROMPT = """You are running on an Orange Pi Linux machine.
+You may use an MCP-style tool named terminal.exec when terminal access is enabled by the user.
+If and only if you need to run a shell command, call the tool by replying with exactly one tag in this format and nothing else:
+<exec>your command here</exec>
+Rules:
+- Use a single command only.
+- Prefer read-only inspection commands when possible.
+- Do not ask for confirmation.
+- After tool output is provided, answer the user normally and do not emit another exec tag unless another command is strictly required.
+"""
 
 
 class LLMCallState:
@@ -363,6 +380,78 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (102400, 102400))
 engine = RKLLMEngine(MODEL_PATH, LIB_PATH)
 
 
+def get_system_memory():
+    meminfo = {}
+    with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+        for line in handle:
+            key, value = line.split(":", 1)
+            meminfo[key] = value.strip()
+
+    total_kb = int(meminfo.get("MemTotal", "0 kB").split()[0])
+    free_kb = int(meminfo.get("MemFree", "0 kB").split()[0])
+    available_kb = int(meminfo.get("MemAvailable", "0 kB").split()[0])
+    swap_total_kb = int(meminfo.get("SwapTotal", "0 kB").split()[0])
+    swap_free_kb = int(meminfo.get("SwapFree", "0 kB").split()[0])
+    return {
+        "total_mb": round(total_kb / 1024.0),
+        "free_mb": round(free_kb / 1024.0),
+        "available_mb": round(available_kb / 1024.0),
+        "swap_total_mb": round(swap_total_kb / 1024.0),
+        "swap_free_mb": round(swap_free_kb / 1024.0),
+    }
+
+
+def get_model_file_info(model_path: str):
+    stat_result = os.stat(model_path)
+    return {
+        "path": model_path,
+        "size_mb": round(stat_result.st_size / (1024.0 * 1024.0), 1),
+    }
+
+
+def parse_exec_command(text: str):
+    stripped = text.strip()
+    if stripped.startswith("<exec>"):
+        command = stripped[len("<exec>") :]
+        if command.endswith("</exec>"):
+            command = command[: -len("</exec>")]
+        return command.strip() or None
+    malformed_match = re.match(r"^<exec\s+(.+?)>\s*$", stripped, re.DOTALL)
+    if malformed_match:
+        return malformed_match.group(1).strip() or None
+    return None
+
+
+def run_terminal_command(command: str):
+    started_at = time.time()
+    completed = subprocess.run(
+        ["/bin/bash", "-lc", command],
+        capture_output=True,
+        text=True,
+        timeout=COMMAND_TIMEOUT_SECONDS,
+        cwd=os.path.expanduser("~"),
+    )
+    duration_ms = round((time.time() - started_at) * 1000.0, 1)
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    combined = stdout
+    if stderr:
+        combined = f"{combined}\n[stderr]\n{stderr}" if combined else f"[stderr]\n{stderr}"
+    if not combined.strip():
+        combined = "[no output]"
+    truncated = False
+    if len(combined) > MAX_COMMAND_OUTPUT_CHARS:
+        combined = combined[:MAX_COMMAND_OUTPUT_CHARS].rstrip() + "\n[output truncated]"
+        truncated = True
+    return {
+        "command": command,
+        "returncode": completed.returncode,
+        "duration_ms": duration_ms,
+        "output": combined,
+        "truncated": truncated,
+    }
+
+
 def get_available_models():
     items = []
     for model in MODEL_CATALOG:
@@ -389,6 +478,7 @@ def status():
             "ok": True,
             "model": os.path.basename(engine.model_path),
             "models": get_available_models(),
+            "memory": get_system_memory(),
         }
     )
 
@@ -414,12 +504,32 @@ def switch_model():
     if not os.path.exists(target["path"]):
         return jsonify({"error": "model file not found"}), 404
 
+    before_memory = get_system_memory()
+    started_at = time.time()
     try:
         engine.switch_model(target["path"])
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+    load_time_ms = round((time.time() - started_at) * 1000.0, 1)
+    after_memory = get_system_memory()
+    model_info = get_model_file_info(target["path"])
 
-    return jsonify({"ok": True, "model": target["id"], "models": get_available_models()})
+    return jsonify(
+        {
+            "ok": True,
+            "model": target["id"],
+            "models": get_available_models(),
+            "memory": after_memory,
+            "model_load": {
+                "label": target["label"],
+                "path": model_info["path"],
+                "size_mb": model_info["size_mb"],
+                "load_time_ms": load_time_ms,
+                "memory_before": before_memory,
+                "memory_after": after_memory,
+            },
+        }
+    )
 
 
 @app.post("/api/stop")
@@ -432,13 +542,72 @@ def stop_chat():
 def chat():
     data = request.get_json(silent=True) or {}
     prompt = (data.get("message") or "").strip()
+    allow_terminal = bool(data.get("allow_terminal"))
     if not prompt:
         return jsonify({"error": "message is required"}), 400
 
+    def stream_once(message: str):
+        full_text = ""
+        final_stats = None
+        for chunk in engine.stream_chat(message):
+            if chunk["type"] == "token":
+                full_text += chunk["text"]
+            elif chunk["type"] == "meta":
+                final_stats = chunk["stats"]
+        return full_text, final_stats
+
     def generate():
         try:
-            for chunk in engine.stream_chat(prompt):
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            if not allow_terminal:
+                for chunk in engine.stream_chat(prompt):
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                return
+
+            current_prompt = (
+                f"{TERMINAL_TOOL_PROMPT}\n"
+                f"User request:\n{prompt}\n"
+                "If no terminal command is needed, answer directly."
+            )
+
+            for _ in range(MAX_TOOL_STEPS):
+                assistant_text, final_stats = stream_once(current_prompt)
+                exec_command = parse_exec_command(assistant_text)
+                if exec_command is None:
+                    for char in assistant_text:
+                        yield f"data: {json.dumps({'type': 'token', 'text': char}, ensure_ascii=False)}\n\n"
+                    if final_stats is not None:
+                        yield f"data: {json.dumps({'type': 'meta', 'stats': final_stats}, ensure_ascii=False)}\n\n"
+                    return
+
+                yield f"data: {json.dumps({'type': 'tool_call', 'command': exec_command}, ensure_ascii=False)}\n\n"
+                try:
+                    result = run_terminal_command(exec_command)
+                except subprocess.TimeoutExpired:
+                    result = {
+                        "command": exec_command,
+                        "returncode": 124,
+                        "duration_ms": COMMAND_TIMEOUT_SECONDS * 1000.0,
+                        "output": f"[timed out after {COMMAND_TIMEOUT_SECONDS}s]",
+                        "truncated": False,
+                    }
+
+                yield f"data: {json.dumps({'type': 'tool_result', 'result': result}, ensure_ascii=False)}\n\n"
+                current_prompt = (
+                    "Tool result from terminal.exec.\n"
+                    f"Command: {result['command']}\n"
+                    f"Exit code: {result['returncode']}\n"
+                    f"Duration ms: {result['duration_ms']}\n"
+                    "Output:\n"
+                    f"{result['output']}\n\n"
+                    "Now answer the user normally. Do not emit an exec tag unless another command is strictly required."
+                )
+
+            fallback_text = "Tool loop limit reached. Answer without more terminal commands."
+            assistant_text, final_stats = stream_once(fallback_text)
+            for char in assistant_text:
+                yield f"data: {json.dumps({'type': 'token', 'text': char}, ensure_ascii=False)}\n\n"
+            if final_stats is not None:
+                yield f"data: {json.dumps({'type': 'meta', 'stats': final_stats}, ensure_ascii=False)}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
 
