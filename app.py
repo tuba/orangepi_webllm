@@ -59,6 +59,15 @@ Rules:
 - Use a single command only.
 - Prefer read-only inspection commands when possible.
 - If you output a command directly, output only the command line and nothing else.
+- For directory contents, prefer `ls -la`.
+- For the current directory, prefer `pwd`.
+- For kernel and system version, prefer `uname -a`.
+- If the user asks about files, directories, processes, memory, kernel, uptime, or other machine state, use terminal.exec instead of guessing.
+- Examples:
+  - "What is in this directory?" -> `<exec>ls -la</exec>`
+  - "What is the full path?" -> `<exec>pwd</exec>`
+  - "Is there a home directory?" -> `<exec>echo $HOME && ls -ld "$HOME"</exec>`
+  - "Create hello_world.txt" -> `<exec>printf 'Hello world\n' > hello_world.txt && ls -l hello_world.txt</exec>`
 - Do not ask for confirmation.
 - After tool output is provided, answer the user normally and do not emit another exec tag unless another command is strictly required.
 """
@@ -424,8 +433,8 @@ def detect_builtin_answer(prompt: str):
         ]
     ):
         return (
-            "Размер контекста текущей конфигурации RKLLM: 4096 токенов.\n\n"
-            f"Активная модель: {os.path.basename(engine.model_path)}"
+            "Context size for the current RKLLM configuration: 4096 tokens.\n\n"
+            f"Active model: {os.path.basename(engine.model_path)}"
         )
     if any(
         phrase in normalized
@@ -442,12 +451,14 @@ def detect_builtin_answer(prompt: str):
 
 def parse_exec_command(text: str):
     stripped = text.strip()
+    if stripped.startswith("`") and stripped.endswith("`") and "\n" not in stripped:
+        stripped = stripped.strip("`").strip()
     if stripped.startswith("<exec>"):
         command = stripped[len("<exec>") :]
         if command.endswith("</exec>"):
             command = command[: -len("</exec>")]
         return command.strip() or None
-    fenced_match = re.match(r"^```(?:bash|sh)?\s*\n(.+?)\n```$", stripped, re.DOTALL)
+    fenced_match = re.match(r"^```(?:[a-zA-Z0-9_+-]+)?\s*\n(.+?)\n```$", stripped, re.DOTALL)
     if fenced_match:
         candidate = fenced_match.group(1).strip()
         if "\n" not in candidate:
@@ -497,6 +508,93 @@ def run_terminal_command(command: str):
         "output": combined,
         "truncated": truncated,
     }
+
+
+def normalize_tool_text(text: str):
+    stripped = (text or "").strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        stripped = re.sub(r"^```(?:[a-zA-Z0-9_+-]+)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    return re.sub(r"\s+", " ", stripped).strip().lower()
+
+
+def get_prompt_intent(prompt: str):
+    normalized = prompt.strip().lower()
+    if any(
+        phrase in normalized
+        for phrase in [
+            "what is in my current directory",
+            "what is in the current directory",
+            "what is in my directory",
+            "list files",
+            "directory contents",
+            "что в директории",
+            "что у меня в директории",
+            "содержимое директории",
+            "что в папке",
+        ]
+    ):
+        return "dir_contents"
+    if any(
+        phrase in normalized
+        for phrase in [
+            "full path",
+            "current directory",
+            "working directory",
+            "where am i",
+            "pwd",
+            "полный путь",
+            "текущая директория",
+            "где я",
+        ]
+    ):
+        return "cwd"
+    if any(
+        phrase in normalized
+        for phrase in [
+            "home directory",
+            "home dir",
+            "есть хоум директория",
+            "домашняя директория",
+            "home папка",
+        ]
+    ):
+        return "home_dir"
+    if any(
+        phrase in normalized
+        for phrase in [
+            "create file",
+            "create a file",
+            "make a file",
+            "hello world txt",
+            "создать файл",
+            "сделай файл",
+            "создай файл",
+        ]
+    ):
+        return "create_file"
+    return None
+
+
+def is_tool_required_for_prompt(prompt: str):
+    return get_prompt_intent(prompt) is not None
+
+
+def is_command_relevant_for_intent(prompt: str, command: str):
+    intent = get_prompt_intent(prompt)
+    if intent is None:
+        return True
+    normalized = command.strip().lower()
+    first_word = normalized.split()[0] if normalized else ""
+    if intent == "dir_contents":
+        return first_word in {"ls", "find", "tree"}
+    if intent == "cwd":
+        return first_word in {"pwd", "readlink", "realpath", "echo"}
+    if intent == "home_dir":
+        return "$home" in normalized or "~" in normalized or first_word in {"echo", "ls", "test", "stat"}
+    if intent == "create_file":
+        return any(token in normalized for token in [">", "touch", "printf", "tee", "cat <<", "echo "])
+    return True
 
 
 def get_available_models():
@@ -622,16 +720,48 @@ def chat():
                 f"User request:\n{prompt}\n"
                 "If no terminal command is needed, answer directly."
             )
+            last_tool_output = None
+            tool_required = is_tool_required_for_prompt(prompt)
+            tool_used = False
 
             for _ in range(MAX_TOOL_STEPS):
                 assistant_text, final_stats = stream_once(current_prompt, keep_history=0)
                 exec_command = parse_exec_command(assistant_text)
                 if exec_command is None:
-                    for char in assistant_text:
-                        yield f"data: {json.dumps({'type': 'token', 'text': char}, ensure_ascii=False)}\n\n"
-                    if final_stats is not None:
-                        yield f"data: {json.dumps({'type': 'meta', 'stats': final_stats}, ensure_ascii=False)}\n\n"
-                    return
+                    if tool_required and not tool_used:
+                        current_prompt = (
+                            f"{TERMINAL_TOOL_PROMPT}\n"
+                            "Answer in the same language as the user.\n"
+                            f"User request:\n{prompt}\n"
+                            "You must call terminal.exec for this request before answering. Do not answer from memory or output placeholders."
+                        )
+                        continue
+                    normalized_answer = normalize_tool_text(assistant_text)
+                    normalized_prompt = normalize_tool_text(prompt)
+                    normalized_tool_output = normalize_tool_text(last_tool_output)
+                    if normalized_answer and normalized_answer != normalized_prompt and normalized_answer != normalized_tool_output:
+                        for char in assistant_text:
+                            yield f"data: {json.dumps({'type': 'token', 'text': char}, ensure_ascii=False)}\n\n"
+                        if final_stats is not None:
+                            yield f"data: {json.dumps({'type': 'meta', 'stats': final_stats}, ensure_ascii=False)}\n\n"
+                        return
+                    current_prompt = (
+                        f"{TERMINAL_TOOL_PROMPT}\n"
+                        "Answer in the same language as the user.\n"
+                        f"User request:\n{prompt}\n"
+                        "You repeated the user request or raw tool output, or produced an unusable answer. If machine state is needed, call terminal.exec now. Otherwise give a short natural-language answer."
+                    )
+                    continue
+
+                if not is_command_relevant_for_intent(prompt, exec_command):
+                    current_prompt = (
+                        f"{TERMINAL_TOOL_PROMPT}\n"
+                        "Answer in the same language as the user.\n"
+                        f"User request:\n{prompt}\n"
+                        f"You selected this command: {exec_command}\n"
+                        "That command does not match the user's intent well enough. Choose a more relevant terminal command now."
+                    )
+                    continue
 
                 yield f"data: {json.dumps({'type': 'tool_call', 'command': exec_command}, ensure_ascii=False)}\n\n"
                 try:
@@ -646,6 +776,8 @@ def chat():
                     }
 
                 yield f"data: {json.dumps({'type': 'tool_result', 'result': result}, ensure_ascii=False)}\n\n"
+                last_tool_output = result["output"]
+                tool_used = True
                 current_prompt = (
                     "Answer in the same language as the user.\n"
                     f"Original user request:\n{prompt}\n\n"
@@ -655,7 +787,7 @@ def chat():
                     f"Duration ms: {result['duration_ms']}\n"
                     "Output:\n"
                     f"{result['output']}\n\n"
-                    "Now answer the user normally in plain language. Do not just repeat the command or wrap the output in a code block unless the user asked for raw output. Do not emit an exec tag unless another command is strictly required."
+                    "Now answer the user normally in plain language. Do not repeat the raw tool output verbatim. Summarize or interpret it for the user. Do not wrap the output in a code block unless the user asked for raw output. Do not emit an exec tag unless another command is strictly required."
                 )
 
             fallback_text = (

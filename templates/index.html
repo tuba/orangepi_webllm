@@ -320,6 +320,63 @@
       padding: 0 4px;
     }
 
+    .tool-host {
+      width: 100%;
+      padding: 0 4px;
+    }
+
+    .tool-panel {
+      margin-top: 6px;
+      width: 100%;
+      border: 1px solid rgba(103, 232, 249, 0.14);
+      border-radius: 16px;
+      background: rgba(7, 16, 34, 0.5);
+      overflow: hidden;
+    }
+
+    .tool-panel summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 12px 14px;
+      color: var(--muted);
+      font-size: 13px;
+      user-select: none;
+    }
+
+    .tool-panel summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .tool-content {
+      padding: 0 14px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .tool-entry-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--accent);
+      margin-bottom: 6px;
+    }
+
+    .tool-entry pre {
+      margin: 0;
+      overflow-x: auto;
+      background: rgba(0, 0, 0, 0.26);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      padding: 12px 14px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text);
+      font-family: "Cascadia Code", "Consolas", monospace;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
     .toggle-row {
       display: flex;
       align-items: flex-start;
@@ -588,19 +645,53 @@
       const meta = document.createElement("div");
       meta.className = "message-meta";
 
-      wrapper.append(label, bubble, meta);
+      const toolHost = document.createElement("div");
+      toolHost.className = "tool-host";
+
+      wrapper.append(label, bubble, toolHost, meta);
       messagesEl.appendChild(wrapper);
       scrollToBottom();
-      return { bubble, meta };
+      return { wrapper, bubble, meta, toolHost };
     }
 
-    function addToolMessage(title, text, metaText = "") {
-      const message = addMessage("assistant", "");
-      message.bubble.innerHTML = renderMarkdown(`### ${title}\n\n\`\`\`\n${text}\n\`\`\``);
-      if (metaText) {
-        message.meta.textContent = metaText;
+    function ensureToolPanel(message) {
+      let details = message.toolHost.querySelector(".tool-panel");
+      if (details) {
+        return details;
       }
-      return message;
+
+      details = document.createElement("details");
+      details.className = "tool-panel";
+
+      const summary = document.createElement("summary");
+      summary.textContent = "Thinking: terminal";
+
+      const content = document.createElement("div");
+      content.className = "tool-content";
+
+      details.append(summary, content);
+      message.toolHost.appendChild(details);
+      return details;
+    }
+
+    function appendToolEntry(message, label, text, summaryText) {
+      const details = ensureToolPanel(message);
+      details.querySelector("summary").textContent = summaryText;
+
+      const content = details.querySelector(".tool-content");
+      const entry = document.createElement("div");
+      entry.className = "tool-entry";
+
+      const entryLabel = document.createElement("div");
+      entryLabel.className = "tool-entry-label";
+      entryLabel.textContent = label;
+
+      const pre = document.createElement("pre");
+      pre.textContent = text;
+
+      entry.append(entryLabel, pre);
+      content.appendChild(entry);
+      scrollToBottom();
     }
 
     function escapeHtml(text) {
@@ -753,12 +844,18 @@
             assistantMeta.textContent =
               `${payload.stats.tokens} tokens • ${Number(payload.stats.tokens_per_second || 0).toFixed(2)} tok/s • prefill ${payload.stats.prefill_tokens} • ${Number(payload.stats.memory_usage_mb || 0).toFixed(0)} MB`;
           } else if (payload.type === "tool_call") {
-            addToolMessage("terminal.exec", payload.command, "Tool call");
+            appendToolEntry(
+              assistantMessage,
+              "terminal.exec",
+              payload.command,
+              `Thinking: terminal.exec ${payload.command}`
+            );
           } else if (payload.type === "tool_result") {
-            addToolMessage(
-              "terminal.exec result",
+            appendToolEntry(
+              assistantMessage,
+              `result | exit ${payload.result.returncode} | ${Number(payload.result.duration_ms || 0).toFixed(0)} ms`,
               payload.result.output,
-              `exit ${payload.result.returncode} | ${Number(payload.result.duration_ms || 0).toFixed(0)} ms`
+              `Thinking: terminal.exec ${payload.result.command}`
             );
           } else if (payload.type === "error") {
             assistantMeta.textContent = `Error: ${payload.message}`;
